@@ -295,7 +295,10 @@ class Relay:
         print(f"Relay listening on UDP {self.args.listen}, forwarding to B at {self.b_addr[0]}:{self.b_addr[1]}")
         print("OpenAI: " + ("enabled, model " + os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
                             if os.environ.get("OPENAI_API_KEY") else "no OPENAI_API_KEY, using built-in rules"))
-        threading.Thread(target=self.beacon_loop, daemon=True).start()
+        if self.args.local:
+            print("Local preview: no beacon, room B fixed at " + f"{self.b_addr[0]}:{self.b_addr[1]}")
+        else:
+            threading.Thread(target=self.beacon_loop, daemon=True).start()
         while True:
             try:
                 data, sender = self.sock.recvfrom(8192)
@@ -308,6 +311,8 @@ class Relay:
             if packet.get("protocol") != PROTOCOL:
                 continue
             kind, role = packet.get("kind"), packet.get("role")
+            if self.args.local and sender[0] != "127.0.0.1":
+                continue  # desktop preview: ignore headsets that happen to be on the network
             if role == "B" and sender != self.b_addr:
                 self.b_addr = sender  # room B introduces itself; no IP needs to be typed anywhere
                 self.log("peer", room="B", address=f"{sender[0]}:{sender[1]}")
@@ -355,5 +360,6 @@ if __name__ == "__main__":
     parser.add_argument("--listen", type=int, default=9000, help="UDP port room A sends to")
     parser.add_argument("--b-host", default="127.0.0.1")
     parser.add_argument("--b-port", type=int, default=9002, help="UDP port room B listens on")
+    parser.add_argument("--local", action="store_true", help="desktop preview on this PC only: no beacon, ignore other machines")
     parser.add_argument("--log", default=str(HERE / "relay-log.jsonl"))
     Relay(parser.parse_args()).run()

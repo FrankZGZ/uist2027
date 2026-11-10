@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][ValidateSet('A','B')][string]$Role, [string]$Serial)
+param([Parameter(Mandatory=$true)][ValidateSet("A","B","MR-A","MR-B")][string]$Role, [string]$Serial)
 $ErrorActionPreference = 'Stop'
 $adbPath = 'C:\Program Files\Unity\Hub\Editor\6000.0.46f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK\platform-tools\adb.exe'
 if (!(Test-Path -LiteralPath $adbPath)) {

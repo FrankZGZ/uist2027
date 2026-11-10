@@ -17,8 +17,13 @@ public static class QuestSortBuilder
 {
     const string WorkRoot = "../../../work/";
 
-    [MenuItem("Mystery Sort/Build Quest A and B")]
-    public static void BuildBoth()
+    [MenuItem("Mystery Sort/Build Quest A and B (VR)")]
+    public static void BuildBoth() { Build(false); }
+
+    [MenuItem("Mystery Sort/Build Quest A and B (MR passthrough)")]
+    public static void BuildMR() { Build(true); }
+
+    static void Build(bool mr)
     {
 #if UNITY_EDITOR_WIN
         // Windows packaged-app temp redirection can break JDK Unix-domain wakeup sockets.
@@ -47,6 +52,8 @@ public static class QuestSortBuilder
         ConfigureXR();
         var config = OVRProjectConfig.CachedProjectConfig;
         config.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersAndHands;
+        // Adds the passthrough feature to the Android manifest.
+        config.insightPassthroughSupport = mr ? OVRProjectConfig.FeatureSupport.Supported : OVRProjectConfig.FeatureSupport.None;
         EditorUtility.SetDirty(config);
         Directory.CreateDirectory("../Quest-APK");
 
@@ -58,7 +65,7 @@ public static class QuestSortBuilder
         {
             var scene = EditorSceneManager.OpenScene("Assets/Scenes/MysterySort.unity");
             var demo = UnityEngine.Object.FindFirstObjectByType<SortDemo>();
-            demo.role = role; demo.vr = true;
+            demo.role = role; demo.vr = true; demo.mr = mr;
             demo.port = role == SortDemo.Role.A ? SortDemo.RelayPort : SortDemo.RoomBPort;
 
             var rigPrefab = AssetDatabase.LoadAssetAtPath<GameObject>("Packages/com.meta.xr.sdk.core/Prefabs/OVRCameraRig.prefab");
@@ -72,24 +79,31 @@ public static class QuestSortBuilder
             var hand = right.GetComponent<OVRHand>(); SetEnum(hand, "HandType", 1);
             SetEnum(right.GetComponent<OVRSkeleton>(), "_skeletonType", 1);
             var mesh = right.GetComponent<OVRMesh>(); if (mesh != null) SetEnum(mesh, "_meshType", 1);
+            if (mr)
+            {
+                rig.GetComponent<OVRManager>().isInsightPassthroughEnabled = true;
+                var passthrough = rig.AddComponent<OVRPassthroughLayer>();
+                passthrough.overlayType = OVROverlay.OverlayType.Underlay; // real room behind everything virtual
+            }
             demo.questRig = rig; demo.rightHand = hand; rig.SetActive(false);
 
-            string scenePath = "Assets/Scenes/QuestSort" + role + ".unity";
+            string tag = (mr ? "MR-" : "") + role;
+            string scenePath = "Assets/Scenes/QuestSort" + tag.Replace("-", "") + ".unity";
             EditorSceneManager.SaveScene(scene, scenePath);
-            PlayerSettings.productName = "Mystery Sort " + role;
+            PlayerSettings.productName = "Mystery Sort " + tag.Replace("-", " ");
             PlayerSettings.bundleVersion = "0.1.0";
             PlayerSettings.Android.bundleVersionCode = 1;
-            PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Android, "com.localvr.mysterysort." + role.ToString().ToLowerInvariant());
+            PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Android, "com.localvr.mysterysort." + tag.Replace("-", "").ToLowerInvariant());
             AssetDatabase.SaveAssets();
-            string gradlePath = Path.GetFullPath(WorkRoot + "quest-gradle-sort/" + role);
+            string gradlePath = Path.GetFullPath(WorkRoot + "quest-gradle-sort/" + tag);
             var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
             {
                 scenes = new[] { scenePath }, locationPathName = gradlePath,
                 target = BuildTarget.Android, options = BuildOptions.Development | BuildOptions.AcceptExternalModificationsToPlayer
             });
             if (report.summary.result != BuildResult.Succeeded) throw new Exception("Quest " + role + " build failed: " + report.summary.result);
-            RunGradle(gradlePath, role.ToString());
-            Debug.Log("SORT_QUEST_APK_OK " + role);
+            RunGradle(gradlePath, tag);
+            Debug.Log("SORT_QUEST_APK_OK " + tag);
         }
         EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene("Assets/Scenes/QuestSortA.unity", true) };
         AssetDatabase.SaveAssets();

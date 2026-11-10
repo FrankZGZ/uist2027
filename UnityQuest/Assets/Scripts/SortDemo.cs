@@ -12,7 +12,9 @@ namespace MysterySort
     public sealed class Panel
     {
         public int id; public string name;
-        public Vector3 pos; public Quaternion rot;
+        public Transform root;
+        public Vector3 pos => root.position;
+        public Quaternion rot => root.rotation;
         public float w, h, dx, dy;
         public Vector3 Forward => rot * Vector3.forward;
         public Vector3 Right => rot * Vector3.right;
@@ -40,6 +42,8 @@ namespace MysterySort
         public bool vr;
         public GameObject questRig;
         public OVRHand rightHand;
+        // Mixed reality: passthrough background, no virtual room, panels placed in the real room.
+        public bool mr;
         public const int RelayPort = 9000, RoomBPort = 9002;
 
         const int N = SortTransport.Notes;
@@ -69,7 +73,10 @@ namespace MysterySort
         RelayDiscovery discovery;
         LineRenderer rayLine;
         TextMesh clueText;
-        bool wasPressed;
+        bool wasPressed, gripWas;
+        float aimDistance = 1.5f, moveDistance, resetHeld;
+        int movingPanel = -1;
+        Vector3[] defaultPos; Quaternion[] defaultRot;
         string inputNote = "", netNote = "";
 
         // A
@@ -112,7 +119,6 @@ namespace MysterySort
             logPath = Path.Combine(smoke ? smokeDir : Application.persistentDataPath, "events-" + role + ".jsonl");
             File.WriteAllText(logPath, "");
             font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
-            noteScale = role == Role.B ? 1.7f : 1f;
 
             if (vr)
             {
@@ -126,22 +132,40 @@ namespace MysterySort
                 if (xrStarted && questRig != null)
                 {
                     // A stands just in front of the desk panels; B stands back to take in the whole room.
-                    questRig.transform.position = role == Role.A ? new Vector3(0, 0, -0.1f) : new Vector3(0, 0, -0.9f);
+                    // In MR the rig stays at the tracking origin, so virtual metres are real metres from where the user stands.
+                    questRig.transform.position = mr ? Vector3.zero : role == Role.A ? new Vector3(0, 0, -0.1f) : new Vector3(0, 0, -0.9f);
                     questRig.SetActive(true);
                     cam.gameObject.SetActive(false);
                     cam = questRig.GetComponent<OVRCameraRig>().centerEyeAnchor.GetComponent<Camera>();
+                    // Passthrough is composited under the scene: anything the camera leaves transparent shows the real room.
+                    if (mr) { cam.clearFlags = CameraClearFlags.SolidColor; cam.backgroundColor = new Color(0, 0, 0, 0); }
                 }
                 else vr = false; // no headset runtime: fall back to the flat view so the app is not black
             }
 
+            if (!vr) mr = false;
+            noteScale = role == Role.B ? (mr ? 1.3f : 1.7f) : 1f;
             BuildRoom();
             for (int i = 0; i < N; i++) { notes[i] = BuildNote(i); loc[i] = 0; Snap(i, 0); }
 
             // A sees the collaborator standing still (one-way prototype). B sees it act.
-            Vector3 start = role == Role.A ? new Vector3(0, 0, 2.5f) : new Vector3(0, 0, 2.2f);
+            Vector3 start = role == Role.A ? new Vector3(0, 0, mr ? 2.3f : 2.5f) : new Vector3(0, 0, mr ? 1.8f : 2.2f);
             GameObject avatar = Instantiate(avatarPrefab, start, Quaternion.Euler(0, 180, 0));
             avatar.name = "Collaborator";
             actor = avatar.AddComponent<AvatarActor>(); actor.Viewer = cam.transform; actor.Initialize(controller);
+            if (mr)
+            {
+                // No virtual floor to catch a shadow: a soft dark disc under the feet keeps the avatar from looking afloat.
+                Shader blob = Shader.Find("Sprites/Default");
+                if (blob != null)
+                {
+                    var disc = GameObject.CreatePrimitive(PrimitiveType.Quad); Destroy(disc.GetComponent<Collider>());
+                    disc.name = "Contact shadow"; disc.transform.SetParent(avatar.transform, false);
+                    disc.transform.localPosition = new Vector3(0, 0.01f, 0); disc.transform.localRotation = Quaternion.Euler(90, 0, 0);
+                    disc.transform.localScale = new Vector3(0.75f, 0.55f, 1);
+                    var shade = new Material(blob); shade.color = new Color(0, 0, 0, 0.4f); disc.GetComponent<Renderer>().material = shade;
+                }
+            }
 
             if (vr)
             {
@@ -184,9 +208,11 @@ namespace MysterySort
 
         Panel MakePanel(int id, string name, Vector3 pos, float yaw, float w, float h, float dx, float dy, Color color)
         {
-            var p = new Panel { id = id, name = name, pos = pos, rot = Quaternion.Euler(0, yaw, 0), w = w, h = h, dx = dx, dy = dy };
-            Box(name, pos + p.Forward * 0.02f, p.rot, new Vector3(w, h, 0.03f), color);
-            Label(name + " label", pos + Vector3.up * (h / 2 + 0.07f * noteScale) - p.Forward * 0.01f, p.rot, 0.011f * noteScale, new Color(0.85f, 0.93f, 1f)).text = name;
+            var root = new GameObject(name + " root").transform;
+            root.SetPositionAndRotation(pos, Quaternion.Euler(0, yaw, 0));
+            var p = new Panel { id = id, name = name, root = root, w = w, h = h, dx = dx, dy = dy };
+            Box(name, pos + p.Forward * 0.02f, p.rot, new Vector3(w, h, 0.03f), color).transform.SetParent(root, true);
+            Label(name + " label", pos + Vector3.up * (h / 2 + 0.07f * noteScale) - p.Forward * 0.01f, p.rot, 0.011f * noteScale, new Color(0.85f, 0.93f, 1f), root).text = name;
             return p;
         }
 
@@ -195,13 +221,17 @@ namespace MysterySort
             RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat; RenderSettings.ambientLight = new Color(0.62f, 0.66f, 0.72f);
             var sun = new GameObject("Key light").AddComponent<Light>(); sun.type = LightType.Directional;
             sun.intensity = 1.1f; sun.transform.rotation = Quaternion.Euler(45, -35, 0); sun.shadows = LightShadows.Soft;
-            Box("Floor", new Vector3(0, -0.05f, 2), Quaternion.identity, new Vector3(10, 0.1f, 10), new Color(0.12f, 0.17f, 0.23f));
-            Box("Back wall", new Vector3(0, 1.7f, 4.6f), Quaternion.identity, new Vector3(10, 3.5f, 0.1f), new Color(0.20f, 0.27f, 0.35f));
+            if (!mr)
+            {
+                Box("Floor", new Vector3(0, -0.05f, 2), Quaternion.identity, new Vector3(10, 0.1f, 10), new Color(0.12f, 0.17f, 0.23f));
+                Box("Back wall", new Vector3(0, 1.7f, 4.6f), Quaternion.identity, new Vector3(10, 3.5f, 0.1f), new Color(0.20f, 0.27f, 0.35f));
+            }
             Color home = new Color(0.30f, 0.33f, 0.38f), one = new Color(0.20f, 0.42f, 0.33f), two = new Color(0.45f, 0.27f, 0.30f);
+            Color statusColor = new Color(0.75f, 0.94f, 1), noteTextColor = new Color(1f, 0.93f, 0.6f);
             if (role == Role.A)
             {
                 // Compact desk layout: three panels side by side within arm's reach.
-                Box("Desk stand", new Vector3(0, 0.40f, 1.24f), Quaternion.identity, new Vector3(2.3f, 0.8f, 0.04f), new Color(0.16f, 0.20f, 0.26f));
+                if (!mr) Box("Desk stand", new Vector3(0, 0.40f, 1.24f), Quaternion.identity, new Vector3(2.3f, 0.8f, 0.04f), new Color(0.16f, 0.20f, 0.26f));
                 panels = new[]
                 {
                     MakePanel(0, "Clue tray", new Vector3(0, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, home),
@@ -209,9 +239,16 @@ namespace MysterySort
                     MakePanel(2, "Group 2", new Vector3(0.76f, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, two)
                 };
                 if (!vr) { cam.transform.position = new Vector3(0, 1.5f, -0.45f); cam.transform.LookAt(new Vector3(0, 1.08f, 1.2f)); }
-                // In the headset there is no screen overlay: the clue under the pointer is written above the tray.
-                clueText = Label("Clue", new Vector3(0, 1.48f, 1.19f), Quaternion.identity, 0.006f, new Color(1f, 0.93f, 0.6f));
-                wallText = Label("Status", new Vector3(0, 2.75f, 4.5f), Quaternion.identity, 0.02f, new Color(0.75f, 0.94f, 1));
+            }
+            else if (mr)
+            {
+                // Fits a clear floor of about 3.2 m x 3.2 m in front of the observer.
+                panels = new[]
+                {
+                    MakePanel(0, "Clue wall", new Vector3(0, 1.35f, 3.0f), 0, 1.12f, 0.58f, 0.34f, 0.25f, home),
+                    MakePanel(1, "West panel", new Vector3(-1.5f, 1.35f, 1.7f), -65, 1.12f, 0.58f, 0.34f, 0.25f, one),
+                    MakePanel(2, "East panel", new Vector3(1.5f, 1.35f, 1.7f), 65, 1.12f, 0.58f, 0.34f, 0.25f, two)
+                };
             }
             else
             {
@@ -223,10 +260,89 @@ namespace MysterySort
                     MakePanel(2, "East panel", new Vector3(2.3f, 1.35f, 2.4f), 55, 1.45f, 0.74f, 0.44f, 0.32f, two)
                 };
                 if (!vr) { cam.transform.position = new Vector3(0, 1.65f, -0.9f); cam.transform.LookAt(new Vector3(0, 1.3f, 2.5f)); cam.fieldOfView = 72; }
-                wallText = Label("Status", new Vector3(0, 3.05f, 4.5f), Quaternion.identity, 0.026f, new Color(0.75f, 0.94f, 1));
-                captionText = Label("Caption", new Vector3(0, 2.78f, 4.5f), Quaternion.identity, 0.018f, new Color(1f, 0.93f, 0.6f));
+            }
+
+            Transform anchor = panels[0].root; float top = panels[0].h / 2;
+            if (mr)
+            {
+                // No wall to write on: status sits under the first panel, clue text or AI caption above it, and they move with it.
+                wallText = Label("Status", anchor.position, anchor.rotation, 0.0065f * noteScale, statusColor, anchor);
+                wallText.transform.localPosition = new Vector3(0, -top - 0.04f, -0.01f); wallText.anchor = TextAnchor.UpperCenter;
+                var above = Label(role == Role.A ? "Clue" : "Caption", anchor.position, anchor.rotation, 0.0065f * noteScale, noteTextColor, anchor);
+                above.transform.localPosition = new Vector3(0, top + 0.15f * noteScale, -0.01f); above.anchor = TextAnchor.LowerCenter;
+                if (role == Role.A) clueText = above; else captionText = above;
+            }
+            else if (role == Role.A)
+            {
+                // In the headset there is no screen overlay: the clue under the pointer is written above the tray.
+                clueText = Label("Clue", new Vector3(0, 1.48f, 1.19f), Quaternion.identity, 0.006f, noteTextColor);
+                wallText = Label("Status", new Vector3(0, 2.75f, 4.5f), Quaternion.identity, 0.02f, statusColor);
+            }
+            else
+            {
+                wallText = Label("Status", new Vector3(0, 3.05f, 4.5f), Quaternion.identity, 0.026f, statusColor);
+                captionText = Label("Caption", new Vector3(0, 2.78f, 4.5f), Quaternion.identity, 0.018f, noteTextColor);
                 captionText.anchor = TextAnchor.UpperCenter;
             }
+
+            defaultPos = new Vector3[panels.Length]; defaultRot = new Quaternion[panels.Length];
+            for (int i = 0; i < panels.Length; i++) { defaultPos[i] = panels[i].pos; defaultRot[i] = panels[i].rot; }
+            if (vr) LoadLayout();
+        }
+
+        // ---------- panel placement (headset only): where each user put the panels in their own room ----------
+
+        [Serializable] class Layout { public Vector3[] pos; public float[] yaw; }
+
+        string LayoutPath => Path.Combine(Application.persistentDataPath, "layout-" + role + (mr ? "-mr" : "-vr") + ".json");
+
+        void SaveLayout()
+        {
+            var layout = new Layout { pos = new Vector3[panels.Length], yaw = new float[panels.Length] };
+            for (int i = 0; i < panels.Length; i++) { layout.pos[i] = panels[i].pos; layout.yaw[i] = panels[i].rot.eulerAngles.y; }
+            try { File.WriteAllText(LayoutPath, JsonUtility.ToJson(layout)); } catch (Exception e) { Debug.LogWarning(e.Message); }
+        }
+
+        void LoadLayout()
+        {
+            try
+            {
+                if (!File.Exists(LayoutPath)) return;
+                var layout = JsonUtility.FromJson<Layout>(File.ReadAllText(LayoutPath));
+                if (layout?.pos == null || layout.yaw == null || layout.pos.Length != panels.Length || layout.yaw.Length != panels.Length) return;
+                for (int i = 0; i < panels.Length; i++) panels[i].root.SetPositionAndRotation(layout.pos[i], Quaternion.Euler(0, layout.yaw[i], 0));
+            }
+            catch (Exception e) { Debug.LogWarning(e.Message); }
+        }
+
+        void ResetLayout()
+        {
+            for (int i = 0; i < panels.Length; i++) panels[i].root.SetPositionAndRotation(defaultPos[i], defaultRot[i]);
+            for (int i = 0; i < N; i++) if (loc[i] >= 0 && i != held) Snap(i, loc[i]);
+            try { if (File.Exists(LayoutPath)) File.Delete(LayoutPath); } catch (Exception e) { Debug.LogWarning(e.Message); }
+        }
+
+        // Grip on a panel to carry it at the end of the ray; thumbstick pushes it away or pulls it closer.
+        // The panel always turns to face the user. Holding B for two seconds restores the default layout.
+        void MovePanels(Ray ray, bool valid, bool grip, float stick, bool resetButton)
+        {
+            if (movingPanel < 0)
+            {
+                if (valid && grip && !gripWas && held < 0 && Aim(ray, out _, out int target)) { movingPanel = target; moveDistance = aimDistance; }
+            }
+            else if (!valid || !grip) { SaveLayout(); movingPanel = -1; }
+            else
+            {
+                moveDistance = Mathf.Clamp(moveDistance + stick * Time.deltaTime * 1.2f, 0.4f, 6f);
+                Panel moved = panels[movingPanel]; Vector3 at = ray.GetPoint(moveDistance);
+                Vector3 facing = at - cam.transform.position; facing.y = 0;
+                if (facing.sqrMagnitude > 0.01f) moved.root.rotation = Quaternion.LookRotation(facing);
+                moved.root.position = at;
+                for (int i = 0; i < N; i++) if (loc[i] == movingPanel && i != held) Snap(i, movingPanel);
+            }
+            gripWas = grip && valid;
+            resetHeld = resetButton && movingPanel < 0 ? resetHeld + Time.deltaTime : 0;
+            if (resetHeld > 2f) { ResetLayout(); resetHeld = 0; }
         }
 
         Transform BuildNote(int i)
@@ -357,31 +473,52 @@ namespace MysterySort
             return -1;
         }
 
+        // Nearest panel whose rectangle the ray crosses. Panels no longer share one plane once users move them.
+        bool Aim(Ray ray, out Vector3 point, out int panel)
+        {
+            point = Vector3.zero; panel = -1; float best = 8f;
+            foreach (var p in panels)
+            {
+                var plane = new Plane(-p.Forward, p.pos - p.Forward * 0.05f);
+                if (!plane.Raycast(ray, out float d) || d >= best) continue;
+                Vector3 at = ray.GetPoint(d);
+                if (p.Contains(at)) { best = d; point = at; panel = p.id; }
+            }
+            if (panel >= 0) aimDistance = best;
+            return panel >= 0;
+        }
+
         // One pointer for every device: a ray and a pressed flag. Mouse, controller trigger or hand pinch.
         void PointerInput(Ray ray, bool valid, bool pressed)
         {
-            var plane = new Plane(-panels[0].Forward, panels[0].pos - panels[0].Forward * 0.05f);
-            float distance = 0;
-            bool hit = valid && plane.Raycast(ray, out distance) && distance < 6f;
-            Vector3 point = hit ? ray.GetPoint(distance) : Vector3.zero;
+            Vector3 point = Vector3.zero; int over = -1;
+            bool onPanel = valid && Aim(ray, out point, out over);
+            if (valid && !onPanel) point = ray.GetPoint(aimDistance); // between panels: keep the last depth
             if (held < 0)
             {
-                focus = hit ? NoteAt(point) : -1;
+                focus = onPanel ? NoteAt(point) : -1;
                 if (pressed && !wasPressed && focus >= 0) Grab(focus);
             }
             else
             {
                 focus = held;
-                if (hit) { notes[held].position = point; hover = PanelAt(point); }
+                if (valid)
+                {
+                    notes[held].position = point; hover = over;
+                    if (onPanel) notes[held].rotation = panels[over].rot;
+                }
                 // Losing tracking mid-carry must not drop the note somewhere random: it goes back where it was.
-                if (!pressed || !valid) Release(hit && hover >= 0 ? hover : loc[held]);
+                if (!pressed || !valid) Release(valid && hover >= 0 ? hover : loc[held]);
             }
             wasPressed = pressed && valid;
-            if (rayLine != null)
-            {
-                rayLine.enabled = valid;
-                if (valid) { rayLine.SetPosition(0, ray.origin); rayLine.SetPosition(1, hit ? point : ray.GetPoint(2.5f)); }
-            }
+            ShowRay(ray, valid, point);
+        }
+
+        void ShowRay(Ray ray, bool valid, Vector3 end)
+        {
+            if (rayLine == null) return;
+            rayLine.enabled = valid;
+            if (valid) { rayLine.SetPosition(0, ray.origin); rayLine.SetPosition(1, end); }
         }
 
         void MouseInput()
@@ -389,30 +526,44 @@ namespace MysterySort
             PointerInput(cam.ScreenPointToRay(Input.mousePosition), true, Input.GetMouseButton(0));
         }
 
-        // Right Touch controller (index trigger) if one is tracked, otherwise the right hand (index pinch).
-        void HeadsetInput()
+        // Right Touch controller if one is tracked (trigger = notes, grip = panels), otherwise the right hand (index pinch = notes).
+        bool HeadsetRay(out Ray ray, out bool trigger, out bool grip, out float stick, out bool resetButton)
         {
-            Ray ray = default; bool valid = false, pressed = false;
+            ray = default; trigger = grip = resetButton = false; stick = 0;
             var rig = questRig.GetComponent<OVRCameraRig>();
             bool controller = (OVRInput.GetConnectedControllers() & OVRInput.Controller.RTouch) != 0 &&
                 OVRInput.GetControllerPositionTracked(OVRInput.Controller.RTouch);
             if (controller)
             {
                 Transform anchor = rig.rightControllerAnchor;
-                ray = new Ray(anchor.position, anchor.forward); valid = true;
-                pressed = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
-                inputNote = "Right controller: point at a note, hold the trigger, release over a group";
+                ray = new Ray(anchor.position, anchor.forward);
+                trigger = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
+                grip = OVRInput.Get(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.RTouch);
+                stick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick, OVRInput.Controller.RTouch).y;
+                resetButton = OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.RTouch);
+                inputNote = role == Role.A ? "Trigger: move a note.  Grip: move a panel (stick = nearer/farther).  Hold B: reset panels"
+                                           : "Grip: move a panel (stick = nearer/farther).  Hold B: reset panels";
+                return true;
             }
-            else if (rightHand != null && rightHand.IsTracked && rightHand.IsPointerPoseValid)
+            if (rightHand != null && rightHand.IsTracked && rightHand.IsPointerPoseValid)
             {
                 // OVRHand reports its pointer pose in tracking space.
                 Transform space = rig.trackingSpace, pose = rightHand.PointerPose;
-                ray = new Ray(space.TransformPoint(pose.localPosition), space.rotation * pose.localRotation * Vector3.forward); valid = true;
-                pressed = rightHand.GetFingerIsPinching(OVRHand.HandFinger.Index);
-                inputNote = "Right hand: point at a note, pinch and hold, release over a group";
+                ray = new Ray(space.TransformPoint(pose.localPosition), space.rotation * pose.localRotation * Vector3.forward);
+                trigger = rightHand.GetFingerIsPinching(OVRHand.HandFinger.Index);
+                inputNote = role == Role.A ? "Right hand: pinch a note and release it over a group.  Panels need the controller" : "Pick up the right controller to move panels";
+                return true;
             }
-            else inputNote = "No right controller or right hand tracked";
-            PointerInput(ray, valid, pressed);
+            inputNote = "No right controller or right hand tracked";
+            return false;
+        }
+
+        void HeadsetInput()
+        {
+            bool valid = HeadsetRay(out Ray ray, out bool trigger, out bool grip, out float stick, out bool resetButton);
+            MovePanels(ray, valid, grip, stick, resetButton);
+            if (role == Role.A && movingPanel < 0) PointerInput(ray, valid, trigger);
+            else ShowRay(ray, valid, valid ? ray.GetPoint(movingPanel >= 0 ? moveDistance : 2.5f) : Vector3.zero);
         }
 
         // Scripted input for the automated run. f = look at note, g = grab note, m = carry toward panel, r = release on panel.
@@ -606,6 +757,7 @@ namespace MysterySort
             else
             {
                 network.Poll(now);
+                if (vr) HeadsetInput();
                 actor.LookPoint = lookPoint;
                 if (network.TornStamp != tornSeen)
                 {
@@ -623,7 +775,7 @@ namespace MysterySort
                 wallText.text = "ROOM B  |  partner's avatar\n" + (live ? "Avatar: " + avatarDoing : "Waiting for A...");
                 captionText.text = Wrap(network.Caption, 70);
             }
-            if (vr) wallText.text += "\n" + netNote + (role == Role.A ? "\n" + inputNote : "");
+            if (vr) wallText.text += "\n" + netNote + "\n" + inputNote;
             if (smoke)
             {
                 float t = now - smokeStart;

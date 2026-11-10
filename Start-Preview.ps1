@@ -16,7 +16,7 @@ if (!$NoRelay) {
     $python = Join-Path $env:USERPROFILE 'anaconda3\python.exe'
     if (!(Test-Path -LiteralPath $python)) { $python = 'python' }
     $relay = Join-Path $PSScriptRoot 'relay\relay.py'
-    $relayArgs = @(('"' + $relay + '"'), '--listen', '9000', '--b-port', '9002')
+    $relayArgs = @(('"' + $relay + '"'), '--listen', '9000', '--b-port', '9002', '--local')
     if ($SmokeDir) { $relayArgs += @('--log', ('"' + (Join-Path $SmokeDir 'relay-log.jsonl') + '"')) }
     Start-Process -FilePath $python -ArgumentList $relayArgs
     Start-Sleep -Milliseconds 800
