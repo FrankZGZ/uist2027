@@ -1,0 +1,27 @@
+# Secrets: the OpenAI key lives only in relay/.env on the relay PC
+.env
+*.env
+!.env.example
+
+# Unity generated folders
+Library/
+Temp/
+Logs/
+obj/
+UserSettings/
+*.csproj
+*.sln
+
+# Build outputs (rebuild from the Unity projects)
+Windows/
+*.apk
+build*.log
+
+# Run logs and test captures
+smoke/
+relay/relay-log.jsonl
+relay/openai-errors.log
+__pycache__/
+
+# Mixamo source animations are not redistributed; see Unity/Assets/MixamoAnim/README.md
+**/MixamoAnim/*.fbx
