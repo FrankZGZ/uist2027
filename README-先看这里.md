@@ -15,6 +15,17 @@ A 房间的人把线索便利贴归到分组面板上。B 房间的布局不同�
 
 `02-Preview-Direct.cmd` 不经过中转，A 直接发给 B，没有字幕。
 
+桌面预览用的中转带 `--local` 参数，不向局域网广播，也不接受其他机器的数据，所以实验室里开着的头显不会连到它。`Stop-Relay.ps1` 关掉本机上所有这个 demo 的中转进程。
+
+## 头显版
+
+两台 Quest 各装一个应用，电脑跑中转（`03-Start-Relay-For-Quest.cmd`）。有两种形态：
+
+- **VR 版**（`Mystery Sort A / B`）：虚拟房间。
+- **MR 透视版**（`Mystery Sort MR A / MR B`）：面板和化身叠在真实房间上，面板可以用握键抓着摆到房间里任意位置，位置按头显保存。
+
+安装、操作、站位和连不上时的排查都在 `Quest-APK/使用说明.md`。
+
 ## 过程和意图分析
 
 A 端发两种文本给中转：
@@ -59,10 +70,13 @@ key 放在 `relay/.env` 里，这个文件不要提交或发给别人。带 key 
 ## 已验证和未验证
 
 - **已验证**：三个进程（A、中转、B）在本机用脚本输入自动跑通，B 的最终摆放和 A 一致，有 key 和没有 key 两种情况都跑过；截图在 `smoke/`，中转日志在 `smoke/relay-log.jsonl`。
-- **未验证**：两台电脑跨局域网、头显内运行。这个 demo 只有鼠标输入，没有接手部追踪。
+- **头显内**：VR 版在两台 Quest Pro 上实测可用。MR 版已装机运行、透视开启、数据经中转到达 B，画面效果和挪面板的手感还没有逐项确认。
+- **只验证过一条脚本轨迹**：意图解读只在一条固定的犹豫轨迹上检查过，模型给的置信度普遍偏高。
 
 ## 改和重新打包
 
 用 Unity 6000.0.46f1 打开 `Unity` 文件夹，菜单 `Mystery Sort / Generate scene and settings` 生成场景。布局、便利贴内容都在 `SortDemo.cs` 的 `BuildRoom` 和文件顶部的数组里，改完重新打包即可。
+
+头显版在 `UnityQuest` 工程里打包，脚本和 `Unity/Assets/Scripts` 是同一份，改完要复制过去。菜单 `Mystery Sort / Build Quest A and B (VR)` 和 `Build Quest A and B (MR passthrough)` 各生成两个 APK 到 `Quest-APK`。构建脚本的副本在 `Unity/Assets/Editor/QuestSortBuilder.cs.txt`。
 
 原来的 `VRPointingDemo-Source` 和 `QuestStandalone` 没有改动，这个工程是从 `VRPointingDemo-Source` 复制出来的。
