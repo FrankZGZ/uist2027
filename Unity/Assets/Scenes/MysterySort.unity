@@ -119,7 +119,7 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
---- !u!1 &1858365516
+--- !u!1 &926118597
 GameObject:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -127,64 +127,9 @@ GameObject:
   m_PrefabAsset: {fileID: 0}
   serializedVersion: 6
   m_Component:
-  - component: {fileID: 1858365518}
-  - component: {fileID: 1858365517}
-  m_Layer: 0
-  m_Name: Mystery Sort Demo
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!114 &1858365517
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1858365516}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 2ca329325a792de4889b9687afe3e6c8, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  role: 0
-  peerIP: 127.0.0.1
-  port: 9000
-  avatarPrefab: {fileID: 489734350705313215, guid: 63daadf515552544c87b74019b2177db, type: 3}
-  controller: {fileID: 9100000, guid: 36a8097e82ffc124499e1f86eb71ea69, type: 2}
-  surface: {fileID: 2100000, guid: 2e8cfd761cb59ca439638922ca182068, type: 2}
-  cam: {fileID: 1929515133}
-  vr: 0
-  questRig: {fileID: 0}
-  rightHand: {fileID: 0}
-  mr: 0
---- !u!4 &1858365518
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1858365516}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!1 &1929515132
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 1929515135}
-  - component: {fileID: 1929515133}
-  - component: {fileID: 1929515134}
+  - component: {fileID: 926118600}
+  - component: {fileID: 926118598}
+  - component: {fileID: 926118599}
   m_Layer: 0
   m_Name: Desktop Camera
   m_TagString: Untagged
@@ -192,13 +137,13 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!20 &1929515133
+--- !u!20 &926118598
 Camera:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1929515132}
+  m_GameObject: {fileID: 926118597}
   m_Enabled: 1
   serializedVersion: 2
   m_ClearFlags: 2
@@ -243,21 +188,77 @@ Camera:
   m_OcclusionCulling: 1
   m_StereoConvergence: 10
   m_StereoSeparation: 0.022
---- !u!81 &1929515134
+--- !u!81 &926118599
 AudioListener:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1929515132}
+  m_GameObject: {fileID: 926118597}
   m_Enabled: 1
---- !u!4 &1929515135
+--- !u!4 &926118600
 Transform:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1929515132}
+  m_GameObject: {fileID: 926118597}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &1641358189
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1641358191}
+  - component: {fileID: 1641358190}
+  m_Layer: 0
+  m_Name: Mystery Sort Demo
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1641358190
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1641358189}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 2ca329325a792de4889b9687afe3e6c8, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  role: 0
+  peerIP: 127.0.0.1
+  port: 9000
+  avatarPrefab: {fileID: 489734350705313215, guid: 63daadf515552544c87b74019b2177db, type: 3}
+  controller: {fileID: 9100000, guid: 36a8097e82ffc124499e1f86eb71ea69, type: 2}
+  surface: {fileID: 2100000, guid: 2e8cfd761cb59ca439638922ca182068, type: 2}
+  cam: {fileID: 926118598}
+  vr: 0
+  questRig: {fileID: 0}
+  rightHand: {fileID: 0}
+  leftHand: {fileID: 0}
+  mr: 0
+--- !u!4 &1641358191
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1641358189}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: 0, y: 0, z: 0}
@@ -270,5 +271,5 @@ Transform:
 SceneRoots:
   m_ObjectHideFlags: 0
   m_Roots:
-  - {fileID: 1929515135}
-  - {fileID: 1858365518}
+  - {fileID: 926118600}
+  - {fileID: 1641358191}

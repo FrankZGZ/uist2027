@@ -18,14 +18,32 @@ namespace MysterySort
         public float w, h, dx, dy;
         public Vector3 Forward => rot * Vector3.forward;
         public Vector3 Right => rot * Vector3.right;
+        public Vector3 Up => rot * Vector3.up;
+        // The avatar works on this panel from the far side (across a desk) instead of the near side.
+        public bool across;
+        // 0 = upright (wall), 90 = lying flat (desk).
+        public float Tilt => Mathf.Asin(Mathf.Clamp(-Forward.y, -1f, 1f)) * Mathf.Rad2Deg;
+        // Horizontal direction a person working at the panel faces. Holds for upright, tilted and flat panels.
+        public Vector3 Facing { get { Vector3 f = Forward + Up; f.y = 0; return f.sqrMagnitude > 1e-6f ? f.normalized : Vector3.forward; } }
+        public Vector3 Face => across ? -Facing : Facing;
+        // Closer to a desk than to a wall: the arm reaches down and forward.
+        public float ReachBack => Mathf.Lerp(0.45f, 0.25f, Mathf.Clamp01(-Forward.y));
         public Vector3 Slot(int note) => pos + rot * new Vector3((note % 3 - 1) * dx, (0.5f - note / 3) * dy, -0.012f);
         public bool Contains(Vector3 world)
         {
             Vector3 local = Quaternion.Inverse(rot) * (world - pos);
             return Mathf.Abs(local.x) <= w / 2 && Mathf.Abs(local.y) <= h / 2;
         }
-        // Where the avatar stands to reach a slot with its right hand.
-        public Vector3 Stand(Vector3 slot) { Vector3 p = slot - Forward * 0.45f - Right * 0.17f; p.y = 0; return p; }
+        // Where the avatar stands to reach a point with its right hand: `back` metres beyond the panel's edge
+        // on its own side, a little to the left. For an upright panel the edge distance is zero.
+        public Vector3 Stand(Vector3 point, float back = -1f, float side = 0.17f)
+        {
+            if (back < 0) back = ReachBack;
+            Vector3 face = Face, edge = pos + Up * (across ? h / 2 : -h / 2);
+            float toEdge = Mathf.Max(0f, Vector3.Dot(point - edge, face));
+            Vector3 p = point - face * (toEdge + back) - Vector3.Cross(Vector3.up, face) * side;
+            p.y = 0; return p;
+        }
     }
 
     public sealed class SortDemo : MonoBehaviour
@@ -41,7 +59,7 @@ namespace MysterySort
         // Headset build: the rig starts disabled and is switched on once OpenXR is running.
         public bool vr;
         public GameObject questRig;
-        public OVRHand rightHand;
+        public OVRHand rightHand, leftHand;
         // Mixed reality: passthrough background, no virtual room, panels placed in the real room.
         public bool mr;
         public const int RelayPort = 9000, RoomBPort = 9002;
@@ -65,7 +83,11 @@ namespace MysterySort
         Panel[] panels;
         readonly Transform[] notes = new Transform[N];
         readonly Renderer[] noteFaces = new Renderer[N];
-        readonly int[] loc = new int[N];       // A: authoritative. B: where each note is in B's room (-2 = in the avatar's hand)
+        readonly int[] loc = new int[N];       // where each note physically is in THIS room (-2 = in the avatar's hand)
+        // What both rooms agree on: panel per note and how often it has been placed. A placement raises the version;
+        // the higher version wins. When agreed differs from loc, the partner moved the note and the avatar acts it out here.
+        readonly int[] agreed = new int[N], ver = new int[N];
+        int clock, listenPort;
         SortTransport network;
         AvatarActor actor;
         TextMesh wallText, captionText;
@@ -76,7 +98,7 @@ namespace MysterySort
         bool wasPressed, gripWas;
         float aimDistance = 1.5f, moveDistance, resetHeld;
         int movingPanel = -1;
-        Vector3[] defaultPos; Quaternion[] defaultRot;
+        Vector3[] defaultPos; Quaternion[] defaultRot; bool[] defaultAcross;
         string inputNote = "", netNote = "";
 
         // A
@@ -111,7 +133,8 @@ namespace MysterySort
         IEnumerator Start()
         {
             role = Arg("-role", role.ToString()).ToUpperInvariant() == "B" ? Role.B : Role.A;
-            peerIP = Arg("-peer", peerIP);
+            peerIP = Arg("-peer", peerIP); if (peerIP == "none") peerIP = "";
+            if (int.TryParse(Arg("-listen"), out int listen) && listen > 0 && listen < 65536) listenPort = listen;
             if (int.TryParse(Arg("-port"), out int parsed) && parsed > 0 && parsed < 65536) port = parsed;
             smokeDir = Arg("-smokeDir"); smoke = smokeDir != null;
             if (smoke) { vr = false; Directory.CreateDirectory(smokeDir); }
@@ -144,12 +167,12 @@ namespace MysterySort
             }
 
             if (!vr) mr = false;
-            noteScale = role == Role.B ? (mr ? 1.3f : 1.7f) : 1f;
+            noteScale = role == Role.B ? (mr ? 1f : 1.7f) : 1f;
             BuildRoom();
             for (int i = 0; i < N; i++) { notes[i] = BuildNote(i); loc[i] = 0; Snap(i, 0); }
 
-            // A sees the collaborator standing still (one-way prototype). B sees it act.
-            Vector3 start = role == Role.A ? new Vector3(0, 0, mr ? 2.3f : 2.5f) : new Vector3(0, 0, mr ? 1.8f : 2.2f);
+            // The partner's avatar. In room A it starts beside the tray, on the side the user stands on.
+            Vector3 start = role == Role.A ? (vr ? new Vector3(-1.0f, 0, 1.0f) : new Vector3(-1.5f, 0, 0.9f)) : new Vector3(0, 0, mr ? 1.4f : 2.2f);
             GameObject avatar = Instantiate(avatarPrefab, start, Quaternion.Euler(0, 180, 0));
             avatar.name = "Collaborator";
             actor = avatar.AddComponent<AvatarActor>(); actor.Viewer = cam.transform; actor.Initialize(controller);
@@ -169,17 +192,27 @@ namespace MysterySort
 
             if (vr)
             {
+                Shader marker = Shader.Find("Sprites/Default");
+                if (marker != null)
+                {
+                    var ring = GameObject.CreatePrimitive(PrimitiveType.Quad); Destroy(ring.GetComponent<Collider>());
+                    ring.name = "Avatar stand marker"; ring.transform.localScale = new Vector3(0.45f, 0.45f, 1);
+                    var paint = new Material(marker); paint.color = new Color(0.3f, 1f, 0.85f, 0.45f); ring.GetComponent<Renderer>().material = paint;
+                    standMarker = ring.transform; ring.SetActive(false);
+                }
+                if (mr) StartCoroutine(LoadAnchors());
+            }
+            if (vr)
+            {
                 // Headsets do not know the relay's address yet; RelayDiscovery fills it in.
                 discovery = new RelayDiscovery();
-                var transport = new SortTransport();
-                if (role == Role.A) transport.Start(true, "", RelayPort); else transport.Start(false, "", RoomBPort);
-                network = transport;
+                network = new SortTransport(role.ToString()); network.Start(0, "", RelayPort);
                 rayLine = new GameObject("Pointer ray").AddComponent<LineRenderer>();
                 rayLine.material = new Material(surface); rayLine.material.color = new Color(0.3f, 1f, 0.85f);
                 rayLine.startWidth = 0.004f; rayLine.endWidth = 0.002f; rayLine.positionCount = 2; rayLine.enabled = false;
             }
-            else { network = new SortTransport(); network.Start(role == Role.A, peerIP, port); }
-            if (role == Role.B) StartCoroutine(AvatarLoop());
+            else { network = new SortTransport(role.ToString()); network.Start(listenPort, peerIP, port); }
+            StartCoroutine(AvatarLoop());
             smokeStart = Time.unscaledTime;
         }
 
@@ -206,13 +239,13 @@ namespace MysterySort
             return text;
         }
 
-        Panel MakePanel(int id, string name, Vector3 pos, float yaw, float w, float h, float dx, float dy, Color color)
+        Panel MakePanel(int id, string name, Vector3 pos, float yaw, float w, float h, float dx, float dy, Color color, float tilt = 0)
         {
             var root = new GameObject(name + " root").transform;
-            root.SetPositionAndRotation(pos, Quaternion.Euler(0, yaw, 0));
+            root.SetPositionAndRotation(pos, Quaternion.Euler(tilt, yaw, 0));
             var p = new Panel { id = id, name = name, root = root, w = w, h = h, dx = dx, dy = dy };
             Box(name, pos + p.Forward * 0.02f, p.rot, new Vector3(w, h, 0.03f), color).transform.SetParent(root, true);
-            Label(name + " label", pos + Vector3.up * (h / 2 + 0.07f * noteScale) - p.Forward * 0.01f, p.rot, 0.011f * noteScale, new Color(0.85f, 0.93f, 1f), root).text = name;
+            Label(name + " label", pos + p.Up * (h / 2 + 0.07f * noteScale) - p.Forward * 0.01f, p.rot, 0.011f * noteScale, new Color(0.85f, 0.93f, 1f), root).text = name;
             return p;
         }
 
@@ -230,25 +263,41 @@ namespace MysterySort
             Color statusColor = new Color(0.75f, 0.94f, 1), noteTextColor = new Color(1f, 0.93f, 0.6f);
             if (role == Role.A)
             {
-                // Compact desk layout: three panels side by side within arm's reach.
-                if (!mr) Box("Desk stand", new Vector3(0, 0.40f, 1.24f), Quaternion.identity, new Vector3(2.3f, 0.8f, 0.04f), new Color(0.16f, 0.20f, 0.26f));
-                panels = new[]
+                if (vr)
                 {
-                    MakePanel(0, "Clue tray", new Vector3(0, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, home),
-                    MakePanel(1, "Group 1", new Vector3(-0.76f, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, one),
-                    MakePanel(2, "Group 2", new Vector3(0.76f, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, two)
-                };
+                    // Headset: notes are taken by hand, so the panels are spread out and the user walks between them.
+                    // The walk is what gives the avatar in room B time to follow.
+                    panels = new[]
+                    {
+                        MakePanel(0, "Clue tray", new Vector3(0, 1.25f, 1.0f), 0, 0.70f, 0.34f, 0.22f, 0.16f, home),
+                        MakePanel(1, "Group 1", new Vector3(-1.4f, 1.25f, 2.2f), -50, 0.70f, 0.34f, 0.22f, 0.16f, one),
+                        MakePanel(2, "Group 2", new Vector3(1.4f, 1.25f, 2.2f), 50, 0.70f, 0.34f, 0.22f, 0.16f, two)
+                    };
+                }
+                else
+                {
+                    // Desktop: three panels side by side, mouse drag.
+                    Box("Desk stand", new Vector3(0, 0.40f, 1.24f), Quaternion.identity, new Vector3(2.3f, 0.8f, 0.04f), new Color(0.16f, 0.20f, 0.26f));
+                    panels = new[]
+                    {
+                        MakePanel(0, "Clue tray", new Vector3(0, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, home),
+                        MakePanel(1, "Group 1", new Vector3(-0.76f, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, one),
+                        MakePanel(2, "Group 2", new Vector3(0.76f, 1.0f, 1.2f), 0, 0.70f, 0.34f, 0.22f, 0.16f, two)
+                    };
+                }
                 if (!vr) { cam.transform.position = new Vector3(0, 1.5f, -0.45f); cam.transform.LookAt(new Vector3(0, 1.08f, 1.2f)); }
             }
             else if (mr)
             {
-                // Fits a clear floor of about 3.2 m x 3.2 m in front of the observer.
+                // Desk layout: three mats lying flat in a row on a table about 2.2 m long, 0.74 m high,
+                // its near edge about 0.35 m in front of the user. The partner's avatar works from the far side.
                 panels = new[]
                 {
-                    MakePanel(0, "Clue wall", new Vector3(0, 1.35f, 3.0f), 0, 1.12f, 0.58f, 0.34f, 0.25f, home),
-                    MakePanel(1, "West panel", new Vector3(-1.5f, 1.35f, 1.7f), -65, 1.12f, 0.58f, 0.34f, 0.25f, one),
-                    MakePanel(2, "East panel", new Vector3(1.5f, 1.35f, 1.7f), 65, 1.12f, 0.58f, 0.34f, 0.25f, two)
+                    MakePanel(0, "Clue mat", new Vector3(0, 0.745f, 0.55f), 0, 0.70f, 0.34f, 0.22f, 0.16f, home, 90),
+                    MakePanel(1, "Left mat", new Vector3(-0.74f, 0.745f, 0.55f), 0, 0.70f, 0.34f, 0.22f, 0.16f, one, 90),
+                    MakePanel(2, "Right mat", new Vector3(0.74f, 0.745f, 0.55f), 0, 0.70f, 0.34f, 0.22f, 0.16f, two, 90)
                 };
+                foreach (var mat in panels) mat.across = true;
             }
             else
             {
@@ -265,41 +314,60 @@ namespace MysterySort
             Transform anchor = panels[0].root; float top = panels[0].h / 2;
             if (mr)
             {
-                // No wall to write on: status sits under the first panel, clue text or AI caption above it, and they move with it.
+                // No wall to write on: status sits under the first panel; caption and clue share one text above it and move with it.
                 wallText = Label("Status", anchor.position, anchor.rotation, 0.0065f * noteScale, statusColor, anchor);
                 wallText.transform.localPosition = new Vector3(0, -top - 0.04f, -0.01f); wallText.anchor = TextAnchor.UpperCenter;
-                var above = Label(role == Role.A ? "Clue" : "Caption", anchor.position, anchor.rotation, 0.0065f * noteScale, noteTextColor, anchor);
+                var above = Label("Info", anchor.position, anchor.rotation, 0.0065f * noteScale, noteTextColor, anchor);
                 above.transform.localPosition = new Vector3(0, top + 0.15f * noteScale, -0.01f); above.anchor = TextAnchor.LowerCenter;
-                if (role == Role.A) clueText = above; else captionText = above;
-            }
-            else if (role == Role.A)
-            {
-                // In the headset there is no screen overlay: the clue under the pointer is written above the tray.
-                clueText = Label("Clue", new Vector3(0, 1.48f, 1.19f), Quaternion.identity, 0.006f, noteTextColor);
-                wallText = Label("Status", new Vector3(0, 2.75f, 4.5f), Quaternion.identity, 0.02f, statusColor);
+                clueText = captionText = above;
             }
             else
             {
-                wallText = Label("Status", new Vector3(0, 3.05f, 4.5f), Quaternion.identity, 0.026f, statusColor);
-                captionText = Label("Caption", new Vector3(0, 2.78f, 4.5f), Quaternion.identity, 0.018f, noteTextColor);
+                bool small = role == Role.A;
+                wallText = Label("Status", new Vector3(0, small ? 2.75f : 3.05f, 4.5f), Quaternion.identity, small ? 0.02f : 0.026f, statusColor);
+                captionText = Label("Caption", new Vector3(0, small ? 2.5f : 2.78f, 4.5f), Quaternion.identity, small ? 0.014f : 0.018f, noteTextColor);
                 captionText.anchor = TextAnchor.UpperCenter;
+                clueText = Label("Clue", anchor.position, anchor.rotation, 0.006f * noteScale, noteTextColor, anchor);
+                clueText.transform.localPosition = new Vector3(0, top + 0.15f * noteScale, -0.01f); clueText.anchor = TextAnchor.LowerCenter;
             }
 
-            defaultPos = new Vector3[panels.Length]; defaultRot = new Quaternion[panels.Length];
-            for (int i = 0; i < panels.Length; i++) { defaultPos[i] = panels[i].pos; defaultRot[i] = panels[i].rot; }
+            defaultPos = new Vector3[panels.Length]; defaultRot = new Quaternion[panels.Length]; defaultAcross = new bool[panels.Length];
+            for (int i = 0; i < panels.Length; i++) { defaultPos[i] = panels[i].pos; defaultRot[i] = panels[i].rot; defaultAcross[i] = panels[i].across; }
             if (vr) LoadLayout();
         }
 
         // ---------- panel placement (headset only): where each user put the panels in their own room ----------
 
-        [Serializable] class Layout { public Vector3[] pos; public float[] yaw; }
+        [Serializable] class Layout { public Vector3[] pos; public Quaternion[] rot; public bool[] across; }
 
-        string LayoutPath => Path.Combine(Application.persistentDataPath, "layout-" + role + (mr ? "-mr" : "-vr") + ".json");
+        // Room B in MR: mats lie on a real table. They always stay flat and only slide on the table plane.
+        bool Desk => role == Role.B && mr;
+        // Room A in MR: panels hang on real walls. They always stay upright; only position and heading change.
+        bool Wall => role == Role.A && mr;
+        string DeskTag => Desk ? "-desk" : "";
+
+        // A flat mat with the same heading as q, whatever q's tilt (also repairs a mat saved upright by an earlier build).
+        static Quaternion Upright(Quaternion q)
+        {
+            Vector3 f = q * Vector3.forward + q * Vector3.up; f.y = 0;
+            return Quaternion.LookRotation(f.sqrMagnitude < 1e-6f ? Vector3.forward : f.normalized);
+        }
+
+        Quaternion Locked(Quaternion q) => Desk ? Flat(q) : Wall ? Upright(q) : q;
+
+        static Quaternion Flat(Quaternion q)
+        {
+            Vector3 f = q * Vector3.forward + q * Vector3.up; f.y = 0;
+            if (f.sqrMagnitude < 1e-6f) f = Vector3.forward;
+            return Quaternion.LookRotation(f.normalized) * Quaternion.Euler(90, 0, 0);
+        }
+
+        string LayoutPath => Path.Combine(Application.persistentDataPath, "layout-" + role + (mr ? "-mr" : "-vr") + DeskTag + "-v3.json");
 
         void SaveLayout()
         {
-            var layout = new Layout { pos = new Vector3[panels.Length], yaw = new float[panels.Length] };
-            for (int i = 0; i < panels.Length; i++) { layout.pos[i] = panels[i].pos; layout.yaw[i] = panels[i].rot.eulerAngles.y; }
+            var layout = new Layout { pos = new Vector3[panels.Length], rot = new Quaternion[panels.Length], across = new bool[panels.Length] };
+            for (int i = 0; i < panels.Length; i++) { layout.pos[i] = panels[i].pos; layout.rot[i] = panels[i].rot; layout.across[i] = panels[i].across; }
             try { File.WriteAllText(LayoutPath, JsonUtility.ToJson(layout)); } catch (Exception e) { Debug.LogWarning(e.Message); }
         }
 
@@ -309,41 +377,233 @@ namespace MysterySort
             {
                 if (!File.Exists(LayoutPath)) return;
                 var layout = JsonUtility.FromJson<Layout>(File.ReadAllText(LayoutPath));
-                if (layout?.pos == null || layout.yaw == null || layout.pos.Length != panels.Length || layout.yaw.Length != panels.Length) return;
-                for (int i = 0; i < panels.Length; i++) panels[i].root.SetPositionAndRotation(layout.pos[i], Quaternion.Euler(0, layout.yaw[i], 0));
+                if (layout?.pos == null || layout.rot == null || layout.pos.Length != panels.Length || layout.rot.Length != panels.Length) return;
+                for (int i = 0; i < panels.Length; i++)
+                {
+                    panels[i].root.SetPositionAndRotation(layout.pos[i], Locked(layout.rot[i]));
+                    if (layout.across != null && layout.across.Length == panels.Length) panels[i].across = layout.across[i];
+                }
             }
             catch (Exception e) { Debug.LogWarning(e.Message); }
         }
 
         void ResetLayout()
         {
-            for (int i = 0; i < panels.Length; i++) panels[i].root.SetPositionAndRotation(defaultPos[i], defaultRot[i]);
+            for (int i = 0; i < panels.Length; i++) { panels[i].root.SetPositionAndRotation(defaultPos[i], defaultRot[i]); panels[i].across = defaultAcross[i]; }
             for (int i = 0; i < N; i++) if (loc[i] >= 0 && i != held) Snap(i, loc[i]);
             try { if (File.Exists(LayoutPath)) File.Delete(LayoutPath); } catch (Exception e) { Debug.LogWarning(e.Message); }
         }
 
+        // ---------- spatial anchors (MR): each panel is pinned to the real room, not to where the headset was recentred ----------
+        // The anchors live on this headset. Placing a panel replaces its anchor; holding B erases them all.
+
+        [Serializable] class AnchorFile { public string[] uuid; }
+        readonly OVRSpatialAnchor[] anchors = new OVRSpatialAnchor[SortTransport.Panels];
+        readonly bool[] anchorBusy = new bool[SortTransport.Panels];
+        string[] anchorIds = new string[SortTransport.Panels];
+        string anchorNote = "";
+
+        string AnchorPath => Path.Combine(Application.persistentDataPath, "anchors-" + role + DeskTag + ".json");
+
+        void WriteAnchorFile()
+        {
+            try { File.WriteAllText(AnchorPath, JsonUtility.ToJson(new AnchorFile { uuid = anchorIds })); } catch (Exception e) { Debug.LogWarning(e.Message); }
+        }
+
+        int AnchorCount() { int n = 0; foreach (var a in anchors) if (a != null && a.Localized) n++; return n; }
+
+        IEnumerator LoadAnchors()
+        {
+            AnchorFile file = null;
+            try { if (File.Exists(AnchorPath)) file = JsonUtility.FromJson<AnchorFile>(File.ReadAllText(AnchorPath)); }
+            catch (Exception e) { Debug.LogWarning(e.Message); }
+            if (file?.uuid != null && file.uuid.Length == panels.Length) anchorIds = file.uuid;
+            var ids = new List<Guid>(); var panelOf = new Dictionary<Guid, int>();
+            for (int i = 0; i < panels.Length; i++)
+                if (Guid.TryParse(anchorIds[i] ?? "", out Guid id) && id != Guid.Empty) { ids.Add(id); panelOf[id] = i; }
+            if (ids.Count == 0) { anchorNote = "Anchors: none yet. Grip each panel and put it on the real desk or wall"; yield break; }
+
+            anchorNote = "Anchors: looking for this room...";
+            var unbound = new List<OVRSpatialAnchor.UnboundAnchor>();
+            var load = OVRSpatialAnchor.LoadUnboundAnchorsAsync(ids, unbound);
+            while (!load.IsCompleted) yield return null;
+            var result = load.GetResult();
+            if (!result.Success) { anchorNote = "Anchors: could not load (" + result.Status + "). Panels are at their last place"; yield break; }
+
+            // Localise all at once; a room the headset does not recognise must not hold up the others.
+            var pending = new List<(OVRSpatialAnchor.UnboundAnchor anchor, OVRTask<bool> task, int panel)>();
+            foreach (var u in result.Value)
+                if (panelOf.TryGetValue(u.Uuid, out int i)) pending.Add((u, u.Localized ? OVRTask.FromResult(true) : u.LocalizeAsync(20), i));
+            float giveUp = Time.unscaledTime + 25f;
+            while (pending.Count > 0 && Time.unscaledTime < giveUp)
+            {
+                for (int k = pending.Count - 1; k >= 0; k--)
+                {
+                    var (u, task, i) = pending[k];
+                    if (!task.IsCompleted) continue;
+                    pending.RemoveAt(k);
+                    if (!task.GetResult() || movingPanel == i || anchors[i] != null) continue;
+                    var holder = new GameObject("Anchor " + panels[i].name);
+                    if (u.TryGetPose(out Pose pose)) holder.transform.SetPositionAndRotation(pose.position, pose.rotation);
+                    var bound = holder.AddComponent<OVRSpatialAnchor>();
+                    u.BindTo(bound);
+                    anchors[i] = bound;
+                }
+                yield return null;
+            }
+            int found = AnchorCount(), missing = ids.Count - found;
+            anchorNote = missing == 0 ? "Anchors: " + found + " panels pinned to this room"
+                                      : "Anchors: " + missing + " panel(s) not found in this room. Grip them back into place";
+        }
+
+        // Every frame: an anchored panel sits exactly on its anchor, which the headset keeps aligned with the room.
+        void FollowAnchors()
+        {
+            for (int i = 0; i < panels.Length; i++)
+            {
+                var a = anchors[i];
+                if (a == null || !a.Localized || i == movingPanel || (Desk && movingPanel >= 0)) continue; // desk: height changes move all mats
+                Transform t = a.transform; Quaternion want = Locked(t.rotation);
+                if ((panels[i].pos - t.position).sqrMagnitude < 1e-7f && Quaternion.Angle(panels[i].rot, want) < 0.05f) continue;
+                panels[i].root.SetPositionAndRotation(t.position, want);
+                for (int n = 0; n < N; n++) if (loc[n] == i && n != held) Snap(n, i);
+            }
+        }
+
+        IEnumerator AnchorPanel(int i)
+        {
+            while (anchorBusy[i]) yield return null;
+            anchorBusy[i] = true;
+            anchorNote = "Anchors: pinning " + panels[i].name + "...";
+            var old = anchors[i]; anchors[i] = null;
+            if (old != null)
+            {
+                var erase = old.EraseAnchorAsync();
+                while (!erase.IsCompleted) yield return null;
+                Destroy(old.gameObject);
+            }
+            else if (Guid.TryParse(anchorIds[i] ?? "", out Guid stale) && stale != Guid.Empty)
+            {
+                var erase = OVRSpatialAnchor.EraseAnchorsAsync(new List<OVRSpatialAnchor>(), new[] { stale });
+                while (!erase.IsCompleted) yield return null;
+            }
+            anchorIds[i] = ""; WriteAnchorFile();
+            var holder = new GameObject("Anchor " + panels[i].name);
+            holder.transform.SetPositionAndRotation(panels[i].pos, panels[i].rot);
+            var anchor = holder.AddComponent<OVRSpatialAnchor>();
+            var created = anchor.WhenCreatedAsync();
+            while (!created.IsCompleted) yield return null;
+            if (!created.GetResult()) { anchorNote = "Anchors: could not pin " + panels[i].name + ". Try again with more light"; Destroy(holder); anchorBusy[i] = false; yield break; }
+            var save = anchor.SaveAnchorAsync();
+            while (!save.IsCompleted) yield return null;
+            var saved = save.GetResult();
+            if (!saved.Success) { anchorNote = "Anchors: " + panels[i].name + " pinned for now but not saved (" + saved.Status + ")"; }
+            else { anchorIds[i] = anchor.Uuid.ToString(); WriteAnchorFile(); anchorNote = "Anchors: " + AnchorCountAfter(anchor, i) + " panels pinned to this room"; }
+            anchors[i] = anchor;
+            anchorBusy[i] = false;
+        }
+
+        int AnchorCountAfter(OVRSpatialAnchor fresh, int i) { int n = 1; for (int k = 0; k < anchors.Length; k++) if (k != i && anchors[k] != null && anchors[k].Localized) n++; return n; }
+
+        IEnumerator EraseAnchors()
+        {
+            var live = new List<OVRSpatialAnchor>(); var ids = new List<Guid>();
+            for (int i = 0; i < panels.Length; i++)
+            {
+                if (anchors[i] != null) live.Add(anchors[i]);
+                else if (Guid.TryParse(anchorIds[i] ?? "", out Guid id) && id != Guid.Empty) ids.Add(id);
+                anchors[i] = null; anchorIds[i] = "";
+            }
+            WriteAnchorFile();
+            if (live.Count + ids.Count == 0) yield break;
+            var erase = OVRSpatialAnchor.EraseAnchorsAsync(live, ids);
+            while (!erase.IsCompleted) yield return null;
+            foreach (var a in live) if (a != null) Destroy(a.gameObject);
+            anchorNote = "Anchors: erased. Grip each panel and put it on the real desk or wall";
+        }
+
+        // Where the avatar will stand: shown while a panel is being placed and for a few seconds after.
+        Transform standMarker; int markerPanel = -1; float markerUntil;
+
+        void ShowStandMarker()
+        {
+            if (standMarker == null) return;
+            int k = movingPanel >= 0 ? movingPanel : Time.unscaledTime < markerUntil ? markerPanel : -1;
+            standMarker.gameObject.SetActive(k >= 0);
+            if (k < 0) return;
+            Panel p = panels[k];
+            standMarker.position = p.Stand(p.pos) + Vector3.up * 0.01f;
+            standMarker.rotation = Quaternion.LookRotation(Vector3.down, p.Face);
+        }
+
         // Grip on a panel to carry it at the end of the ray; thumbstick pushes it away or pulls it closer.
         // The panel always turns to face the user. Holding B for two seconds restores the default layout.
-        void MovePanels(Ray ray, bool valid, bool grip, float stick, bool resetButton)
+        void MovePanels(Ray ray, bool valid, bool grip, Vector2 stick, bool resetButton, bool flip)
         {
             if (movingPanel < 0)
             {
-                if (valid && grip && !gripWas && held < 0 && Aim(ray, out _, out int target)) { movingPanel = target; moveDistance = aimDistance; }
+                if (valid && grip && !gripWas && held < 0 && Aim(ray, out Vector3 grabbed, out int target))
+                {
+                    movingPanel = target; moveDistance = aimDistance; moveTilt = panels[target].Tilt;
+                    deskOffset = panels[target].pos - grabbed; deskOffset.y = 0; deskHeightChanged = false; moveYaw = 0;
+                }
+                else if (valid && flip && held < 0 && Aim(ray, out _, out int side))
+                {
+                    panels[side].across = !panels[side].across; SaveLayout();
+                    markerPanel = side; markerUntil = Time.unscaledTime + 4f;
+                }
             }
-            else if (!valid || !grip) { SaveLayout(); movingPanel = -1; }
+            else if (!valid || !grip)
+            {
+                SaveLayout();
+                if (mr)
+                {
+                    if (Desk && deskHeightChanged) for (int k = 0; k < panels.Length; k++) StartCoroutine(AnchorPanel(k));
+                    else StartCoroutine(AnchorPanel(movingPanel));
+                }
+                markerPanel = movingPanel; markerUntil = Time.unscaledTime + 4f;
+                movingPanel = -1;
+            }
+            else if (Desk)
+            {
+                // Slide on the table: the mat follows where the ray meets the table plane. Stick left/right turns it,
+                // up/down raises or lowers the table height for all mats together.
+                Panel moved = panels[movingPanel]; float y = moved.pos.y;
+                if (Mathf.Abs(stick.y) > 0.2f)
+                {
+                    y = Mathf.Clamp(y + stick.y * 0.15f * Time.deltaTime, 0.3f, 1.4f); deskHeightChanged = true;
+                    foreach (var mat in panels) { Vector3 at2 = mat.pos; at2.y = y; mat.root.position = at2; }
+                }
+                if (Mathf.Abs(stick.x) > 0.2f) moved.root.rotation = Quaternion.Euler(0, stick.x * 60f * Time.deltaTime, 0) * moved.rot;
+                moved.root.rotation = Flat(moved.rot);
+                var table = new Plane(Vector3.up, new Vector3(0, y, 0));
+                if (table.Raycast(ray, out float d) && d < 6f) { Vector3 at = ray.GetPoint(d) + deskOffset; at.y = y; moved.root.position = at; }
+                for (int k = 0; k < panels.Length; k++) for (int i = 0; i < N; i++) if (loc[i] == k && i != held) Snap(i, k);
+            }
             else
             {
-                moveDistance = Mathf.Clamp(moveDistance + stick * Time.deltaTime * 1.2f, 0.4f, 6f);
+                // Up/down on the stick: nearer or farther. Left/right: tilt from upright (wall) to flat (desk), with a snap at both ends.
+                moveDistance = Mathf.Clamp(moveDistance + stick.y * Time.deltaTime * 1.2f, 0.4f, 6f);
+                if (Wall)
+                {
+                    // Upright only. Left/right on the stick turns the panel to sit flush on a wall that is not square to the user.
+                    moveTilt = 0f;
+                    if (Mathf.Abs(stick.x) > 0.2f) moveYaw = Mathf.Clamp(moveYaw + stick.x * 60f * Time.deltaTime, -90f, 90f);
+                }
+                else if (Mathf.Abs(stick.x) > 0.2f) moveTilt = Mathf.Clamp(moveTilt + stick.x * 70f * Time.deltaTime, 0f, 90f);
+                else if (moveTilt < 6f) moveTilt = 0f; else if (moveTilt > 84f) moveTilt = 90f;
                 Panel moved = panels[movingPanel]; Vector3 at = ray.GetPoint(moveDistance);
                 Vector3 facing = at - cam.transform.position; facing.y = 0;
-                if (facing.sqrMagnitude > 0.01f) moved.root.rotation = Quaternion.LookRotation(facing);
+                if (facing.sqrMagnitude > 0.01f) moved.root.rotation = Quaternion.Euler(0, moveYaw, 0) * Quaternion.LookRotation(facing) * Quaternion.Euler(moveTilt, 0, 0);
                 moved.root.position = at;
                 for (int i = 0; i < N; i++) if (loc[i] == movingPanel && i != held) Snap(i, movingPanel);
             }
             gripWas = grip && valid;
             resetHeld = resetButton && movingPanel < 0 ? resetHeld + Time.deltaTime : 0;
-            if (resetHeld > 2f) { ResetLayout(); resetHeld = 0; }
+            if (resetHeld > 2f) { if (mr) StartCoroutine(EraseAnchors()); ResetLayout(); resetHeld = 0; }
         }
+
+        float moveTilt, moveYaw; Vector3 deskOffset; bool deskHeightChanged;
 
         Transform BuildNote(int i)
         {
@@ -383,9 +643,15 @@ namespace MysterySort
         string Members(int panel)
         {
             var list = new List<string>();
-            for (int i = 0; i < N; i++) if (loc[i] == panel) list.Add(Letter[i]);
+            for (int i = 0; i < N; i++) if (agreed[i] == panel) list.Add(Letter[i]);
             return list.Count == 0 ? "empty" : string.Join(", ", list);
         }
+
+        bool Live => Time.unscaledTime - network.LastReceived <= 1f;
+
+        // A note can be taken only when it is at rest here: not in the partner's hand, not carried by the avatar,
+        // and not waiting for the avatar to move it.
+        bool CanGrab(int note) => loc[note] >= 0 && loc[note] == agreed[note] && carrying != note && !(Live && network.Held == note);
 
         void Grab(int note)
         {
@@ -397,6 +663,7 @@ namespace MysterySort
         void Release(int panel)
         {
             int note = held; loc[note] = panel; Snap(note, panel); held = -1; hover = -1; lastHover = -1;
+            if (panel != grabbedFrom) { agreed[note] = panel; ver[note] = ++clock; }
             string label = "note " + Letter[note] + " [" + Header[note] + "]";
             if (panel == grabbedFrom) Event("put " + label + " back on " + panels[panel].name + " without sorting it");
             else Event((grabbedFrom == 0 ? "place " : "move ") + label + (grabbedFrom == 0 ? "" : " from " + panels[grabbedFrom].name) + " on " + panels[panel].name + "; " + panels[panel].name + " now holds: " + Members(panel));
@@ -450,11 +717,12 @@ namespace MysterySort
         string SceneText()
         {
             var text = new StringBuilder();
-            text.AppendLine("room=" + (role == Role.A ? "A, compact desk layout, user sorts notes by hand" : "B, room-scale layout, observer watches the partner's avatar"));
+            text.AppendLine("room=" + (role == Role.A ? (vr ? "A, room-scale layout, user walks between the panels and moves notes by hand" : "A, compact desk layout, user sorts notes by hand") : (mr ? "B, desk layout, notes spread out on a table, user reaches for them by hand" : "B, room-scale layout, user walks between the panels and moves notes by hand")));
             foreach (var p in panels)
             {
                 Vector3 to = p.pos - cam.transform.position; to.y = 0;
                 text.AppendLine("panel id=" + p.id + " name=\"" + p.name + "\" role=" + (p.id == 0 ? "unsorted clues" : "group") +
+                    (p.Tilt > 45 ? " lying on a desk" : " upright") +
                     " | " + Direction(cam.transform, p.pos) + " of the viewer, " + to.magnitude.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) + " m away");
             }
             for (int i = 0; i < N; i++) text.AppendLine("note " + Letter[i] + " [" + Header[i] + "]: " + Clue[i]);
@@ -497,7 +765,7 @@ namespace MysterySort
             if (held < 0)
             {
                 focus = onPanel ? NoteAt(point) : -1;
-                if (pressed && !wasPressed && focus >= 0) Grab(focus);
+                if (pressed && !wasPressed && focus >= 0 && CanGrab(focus)) Grab(focus);
             }
             else
             {
@@ -526,44 +794,182 @@ namespace MysterySort
             PointerInput(cam.ScreenPointToRay(Input.mousePosition), true, Input.GetMouseButton(0));
         }
 
-        // Right Touch controller if one is tracked (trigger = notes, grip = panels), otherwise the right hand (index pinch = notes).
-        bool HeadsetRay(out Ray ray, out bool trigger, out bool grip, out float stick, out bool resetButton)
+        // ---------- A in the headset: notes are taken by hand, at arm's length ----------
+        // The sender walks up to a note and pinches it; there is no pointing from a distance.
+        // The walk covers the seconds the avatar in room B needs to follow.
+
+        const float GrabReach = 0.09f, NoticeReach = 0.16f, DropDepth = 0.20f;
+        readonly Transform[][] tips = new Transform[2][];
+        readonly bool[] pressWas = new bool[3];
+        readonly Transform[] dots = new Transform[3];
+        int grabSource = -1, reachNote = -1; float openSince = -1, lostSince = -1; Vector3 heldInHead;
+
+        bool ControllerTracked => (OVRInput.GetConnectedControllers() & OVRInput.Controller.RTouch) != 0 &&
+            OVRInput.GetControllerPositionTracked(OVRInput.Controller.RTouch);
+
+        bool Tips(int side, OVRHand hand)
         {
-            ray = default; trigger = grip = resetButton = false; stick = 0;
+            if (tips[side] != null) return true;
+            var skeleton = hand.GetComponent<OVRSkeleton>();
+            if (skeleton == null || !skeleton.IsInitialized || skeleton.Bones == null) return false;
+            var type = skeleton.GetSkeletonType();
+            bool xr = type == OVRSkeleton.SkeletonType.XRHandLeft || type == OVRSkeleton.SkeletonType.XRHandRight;
+            var thumbId = xr ? OVRSkeleton.BoneId.XRHand_ThumbTip : OVRSkeleton.BoneId.Hand_ThumbTip;
+            var indexId = xr ? OVRSkeleton.BoneId.XRHand_IndexTip : OVRSkeleton.BoneId.Hand_IndexTip;
+            Transform thumb = null, index = null;
+            foreach (var bone in skeleton.Bones)
+            {
+                if (bone.Id == thumbId) thumb = bone.Transform; else if (bone.Id == indexId) index = bone.Transform;
+            }
+            if (thumb == null || index == null) return false;
+            tips[side] = new[] { thumb, index };
+            return true;
+        }
+
+        // 0 = left hand, 1 = right hand (point between thumb tip and index tip, pinch), 2 = right controller (its position, trigger).
+        bool Source(int source, out Vector3 point, out bool pressed)
+        {
+            point = default; pressed = false;
             var rig = questRig.GetComponent<OVRCameraRig>();
-            bool controller = (OVRInput.GetConnectedControllers() & OVRInput.Controller.RTouch) != 0 &&
-                OVRInput.GetControllerPositionTracked(OVRInput.Controller.RTouch);
+            if (source == 2)
+            {
+                if (!ControllerTracked) return false;
+                point = rig.rightControllerAnchor.position;
+                pressed = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
+                return true;
+            }
+            OVRHand hand = source == 0 ? leftHand : rightHand;
+            if (hand == null || !hand.IsTracked) return false;
+            pressed = hand.GetFingerIsPinching(OVRHand.HandFinger.Index);
+            if (Tips(source, hand)) point = (tips[source][0].position + tips[source][1].position) / 2;
+            else
+            {
+                // Skeleton not ready yet: the pointer pose origin sits by the hand and is close enough to start with.
+                Transform space = rig.trackingSpace;
+                point = hand.IsPointerPoseValid ? space.TransformPoint(hand.PointerPose.localPosition) : (source == 0 ? rig.leftHandAnchor : rig.rightHandAnchor).position;
+            }
+            return true;
+        }
+
+        float NoteDistance(int note, Vector3 point)
+        {
+            Vector3 local = Quaternion.Inverse(notes[note].rotation) * (point - notes[note].position);
+            float x = Mathf.Max(Mathf.Abs(local.x) - NoteW * noteScale / 2, 0), y = Mathf.Max(Mathf.Abs(local.y) - NoteH * noteScale / 2, 0);
+            return new Vector3(x, y, local.z).magnitude;
+        }
+
+        // The panel a hand is at: inside its rectangle (a little margin) and within reach of its surface.
+        int PanelNear(Vector3 point)
+        {
+            int found = -1; float best = DropDepth;
+            foreach (var p in panels)
+            {
+                Vector3 local = Quaternion.Inverse(p.rot) * (point - p.pos);
+                if (Mathf.Abs(local.x) > p.w / 2 + 0.05f || Mathf.Abs(local.y) > p.h / 2 + 0.05f || Mathf.Abs(local.z) >= best) continue;
+                best = Mathf.Abs(local.z); found = p.id;
+            }
+            return found;
+        }
+
+        void TouchInput(float now)
+        {
+            var point = new Vector3[3]; var valid = new bool[3]; var pressed = new bool[3];
+            for (int s = 0; s < 3; s++) valid[s] = Source(s, out point[s], out pressed[s]);
+            reachNote = -1;
+            if (held < 0)
+            {
+                int near = -1, nearSource = -1; float best = NoticeReach;
+                for (int s = 0; s < 3; s++)
+                {
+                    if (!valid[s]) continue;
+                    for (int i = 0; i < N; i++)
+                    {
+                        float d = NoteDistance(i, point[s]);
+                        if (d < best) { best = d; near = i; nearSource = s; }
+                    }
+                }
+                if (near >= 0)
+                {
+                    focus = near;
+                    if (best <= GrabReach && CanGrab(near))
+                    {
+                        reachNote = near;
+                        if (pressed[nearSource] && !pressWas[nearSource]) { Grab(near); grabSource = nearSource; openSince = lostSince = -1; }
+                    }
+                }
+                else
+                {
+                    // No hand at a note: the note the head is turned toward counts as the one being looked at.
+                    focus = Aim(new Ray(cam.transform.position, cam.transform.forward), out Vector3 seen, out _) ? NoteAt(seen) : -1;
+                }
+            }
+            else
+            {
+                focus = held; int s = grabSource;
+                if (valid[s])
+                {
+                    lostSince = -1;
+                    notes[held].position = point[s]; heldInHead = cam.transform.InverseTransformPoint(point[s]);
+                    hover = PanelNear(point[s]);
+                    Vector3 away = point[s] - cam.transform.position; away.y = 0;
+                    if (hover >= 0) notes[held].rotation = panels[hover].rot;
+                    else if (away.sqrMagnitude > 0.0004f) notes[held].rotation = Quaternion.LookRotation(away);
+                    // A pinch that flickers open for a frame is not a release.
+                    if (pressed[s]) openSince = -1; else if (openSince < 0) openSince = now;
+                    if (openSince >= 0 && now - openSince > 0.12f) { Release(hover >= 0 ? hover : loc[held]); grabSource = -1; }
+                }
+                else
+                {
+                    // The hand left the cameras' view, which happens while walking with the arm down.
+                    // The note stays with the user; only a long loss puts it back.
+                    if (lostSince < 0) lostSince = now;
+                    notes[held].position = cam.transform.TransformPoint(heldInHead); hover = -1;
+                    if (now - lostSince > 4f) { Release(loc[held]); grabSource = -1; }
+                }
+            }
+            for (int s = 0; s < 3; s++)
+            {
+                pressWas[s] = valid[s] && pressed[s];
+                // A small dot shows where the system thinks the pinch is.
+                if (dots[s] == null)
+                {
+                    var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere); Destroy(dot.GetComponent<Collider>());
+                    dot.name = "Pinch point " + s; dot.transform.localScale = Vector3.one * 0.012f;
+                    dot.GetComponent<Renderer>().material = new Material(surface);
+                    dots[s] = dot.transform;
+                }
+                dots[s].gameObject.SetActive(valid[s] && held < 0);
+                if (valid[s])
+                {
+                    dots[s].position = point[s];
+                    dots[s].GetComponent<Renderer>().material.color = pressed[s] ? new Color(1f, 0.9f, 0.3f) : new Color(0.3f, 1f, 0.85f);
+                }
+            }
+        }
+
+        // Right Touch controller: grip on a panel moves it (both rooms). In room A the hands, or the controller held at a note, move notes.
+        void HeadsetInput(float now)
+        {
+            var rig = questRig.GetComponent<OVRCameraRig>();
+            bool controller = ControllerTracked, grip = false, resetButton = false, flip = false; Vector2 stick = Vector2.zero; Ray ray = default;
             if (controller)
             {
                 Transform anchor = rig.rightControllerAnchor;
                 ray = new Ray(anchor.position, anchor.forward);
-                trigger = OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
                 grip = OVRInput.Get(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.RTouch);
-                stick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick, OVRInput.Controller.RTouch).y;
+                stick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick, OVRInput.Controller.RTouch);
                 resetButton = OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.RTouch);
-                inputNote = role == Role.A ? "Trigger: move a note.  Grip: move a panel (stick = nearer/farther).  Hold B: reset panels"
-                                           : "Grip: move a panel (stick = nearer/farther).  Hold B: reset panels";
-                return true;
+                flip = OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch);
             }
-            if (rightHand != null && rightHand.IsTracked && rightHand.IsPointerPoseValid)
-            {
-                // OVRHand reports its pointer pose in tracking space.
-                Transform space = rig.trackingSpace, pose = rightHand.PointerPose;
-                ray = new Ray(space.TransformPoint(pose.localPosition), space.rotation * pose.localRotation * Vector3.forward);
-                trigger = rightHand.GetFingerIsPinching(OVRHand.HandFinger.Index);
-                inputNote = role == Role.A ? "Right hand: pinch a note and release it over a group.  Panels need the controller" : "Pick up the right controller to move panels";
-                return true;
-            }
-            inputNote = "No right controller or right hand tracked";
-            return false;
-        }
-
-        void HeadsetInput()
-        {
-            bool valid = HeadsetRay(out Ray ray, out bool trigger, out bool grip, out float stick, out bool resetButton);
-            MovePanels(ray, valid, grip, stick, resetButton);
-            if (role == Role.A && movingPanel < 0) PointerInput(ray, valid, trigger);
-            else ShowRay(ray, valid, valid ? ray.GetPoint(movingPanel >= 0 ? moveDistance : 2.5f) : Vector3.zero);
+            MovePanels(ray, controller, grip, stick, resetButton, flip);
+            ShowStandMarker();
+            bool show = controller && (grip || movingPanel >= 0);
+            ShowRay(ray, show, show ? ray.GetPoint(movingPanel >= 0 ? moveDistance : 2.5f) : Vector3.zero);
+            if (movingPanel < 0) TouchInput(now);
+            inputNote = !controller ? "Hands: pinch a note with thumb and index finger, let go at a group panel.  Panels need the controller"
+                : Wall ? "Trigger at a note: take it.  Grip on a panel: move it (stick up/down = distance, left/right = turn).  A: avatar side.  Hold B: reset"
+                : Desk ? "Trigger at a note: take it.  Grip on a mat: slide it on the table (stick left/right = turn, up/down = table height).  A: avatar side.  Hold B: reset"
+                : "Trigger at a note: take it.  Grip on a panel: move it (stick up/down = distance, left/right = tilt to desk).  A: avatar side.  Hold B: reset";
         }
 
         // Scripted input for the automated run. f = look at note, g = grab note, m = carry toward panel, r = release on panel.
@@ -571,14 +977,21 @@ namespace MysterySort
         static readonly float[] ScriptTime = { 0.8f, 2.0f, 3.0f, 3.0f, 5.5f, 7.0f, 8.5f, 8.5f, 10.5f, 12.0f, 13.5f, 17.0f, 18.0f, 19.5f, 19.5f, 22.0f, 23.5f, 25.5f };
         static readonly char[] ScriptKind = { 'f', 'f', 'g', 'm', 'r', 'f', 'g', 'm', 'm', 'm', 'm', 'r', 'f', 'g', 'm', 'r', 'f', 'f' };
         static readonly int[] ScriptArg = { 3, 2, 2, 1, 1, 4, 4, 1, 2, 1, 2, 2, 0, 0, 1, 1, 1, -1 };
+        // Room B: looks at F, then sorts it into its panel 2.
+        static readonly float[] ScriptTimeB = { 29.0f, 30.5f, 30.5f, 33.5f };
+        static readonly char[] ScriptKindB = { 'f', 'g', 'm', 'r' };
+        static readonly int[] ScriptArgB = { 5, 5, 2, 2 };
         int scriptStep, scriptPanel = -1, scriptFocus = -1;
 
         void ScriptedInput(float t)
         {
-            while (scriptStep < ScriptTime.Length && t >= ScriptTime[scriptStep])
+            float[] times = role == Role.A ? ScriptTime : ScriptTimeB;
+            char[] kinds = role == Role.A ? ScriptKind : ScriptKindB;
+            int[] args = role == Role.A ? ScriptArg : ScriptArgB;
+            while (scriptStep < times.Length && t >= times[scriptStep])
             {
-                int arg = ScriptArg[scriptStep];
-                switch (ScriptKind[scriptStep])
+                int arg = args[scriptStep];
+                switch (kinds[scriptStep])
                 {
                     case 'f': scriptFocus = arg; break;
                     case 'g': Grab(arg); break;
@@ -599,7 +1012,7 @@ namespace MysterySort
             else focus = scriptFocus;
         }
 
-        // ---------- B: the avatar acts out A's state in B's own layout ----------
+        // ---------- the avatar acts out the partner's state in this room's own layout ----------
 
         IEnumerator AvatarLoop()
         {
@@ -607,12 +1020,12 @@ namespace MysterySort
             idleSince = Time.time; lookPoint = cam.transform.position;
             while (true)
             {
-                int[] wanted = network.Loc; int wantHeld = network.Held, wantHover = network.Hover, wantFocus = network.Focus;
+                int[] wanted = agreed; int wantHeld = network.Held, wantHover = network.Hover, wantFocus = network.Focus;
                 if (carrying < 0)
                 {
                     int note = -1;
-                    if (wantHeld >= 0 && loc[wantHeld] >= 0) note = wantHeld;                      // A just picked something up
-                    else for (int i = 0; i < N; i++) if (loc[i] >= 0 && loc[i] != wanted[i]) { note = i; break; } // catch up on a missed move
+                    if (wantHeld >= 0 && wantHeld != held && loc[wantHeld] >= 0) note = wantHeld;                      // A just picked something up
+                    else for (int i = 0; i < N; i++) if (i != held && loc[i] >= 0 && loc[i] != wanted[i]) { note = i; break; } // catch up on a missed move
                     if (note < 0)
                     {
                         if (wantFocus >= 0 && loc[wantFocus] >= 0)
@@ -623,8 +1036,8 @@ namespace MysterySort
                             lookPoint = at;
                             if (Time.time - watchingSince > 0.5f)
                             {
-                                Vector3 stand = at - p.Forward * 0.95f - p.Right * 0.10f; stand.y = 0;
-                                bool there = actor.Step(stand, p.Forward);
+                                Vector3 stand = p.Stand(at, p.ReachBack + 0.5f, 0.10f);
+                                bool there = actor.Step(stand, p.Face);
                                 avatarDoing = (there ? "reading note " : "walking over to look at note ") + Letter[wantFocus];
                             }
                             else { actor.Stop(); avatarDoing = "glancing at note " + Letter[wantFocus]; }
@@ -642,7 +1055,7 @@ namespace MysterySort
                     Panel src = panels[loc[note]]; Vector3 slot = src.Slot(note);
                     avatarDoing = "walking to " + src.name + " for note " + Letter[note];
                     lookPoint = slot;
-                    yield return actor.WalkTo(src.Stand(slot), src.Forward);
+                    yield return actor.WalkTo(src.Stand(slot), src.Face);
                     // Find it: eyes pass over a neighbouring note before settling on the right one.
                     int neighbour = -1; float nearest = float.MaxValue;
                     for (int i = 0; i < N; i++)
@@ -662,7 +1075,7 @@ namespace MysterySort
                     {
                         actor.Carried = notes[note]; carrying = note; loc[note] = -2;
                         noteFaces[note].material.color = HeldColor;
-                        Log("{\"t\":" + Stamp() + ",\"role\":\"B\",\"avatar\":\"pick " + Letter[note] + " from " + src.name + "\",\"handError\":" + actor.ReachError.ToString("F3", System.Globalization.CultureInfo.InvariantCulture) + "}");
+                        Log("{\"t\":" + Stamp() + ",\"role\":\"" + role + "\",\"avatar\":\"pick " + Letter[note] + " from " + src.name + "\",\"handError\":" + actor.ReachError.ToString("F3", System.Globalization.CultureInfo.InvariantCulture) + "}");
                     });
                 }
                 else
@@ -679,7 +1092,7 @@ namespace MysterySort
                         if (wantHover >= 0)
                         {
                             Panel ahead = panels[wantHover]; lookPoint = ahead.Slot(note);
-                            bool there = actor.Step(ahead.Stand(ahead.Slot(note)), ahead.Forward);
+                            bool there = actor.Step(ahead.Stand(ahead.Slot(note)), ahead.Face);
                             avatarDoing = (there ? "holding note " + Letter[note] + " at " : "carrying note " + Letter[note] + " toward ") + ahead.name;
                         }
                         else { actor.Stop(); lookPoint = notes[note].position; avatarDoing = "holding note " + Letter[note] + ", undecided"; }
@@ -696,13 +1109,13 @@ namespace MysterySort
                     int destination = wanted[note]; Panel to = panels[destination]; Vector3 slot = to.Slot(note);
                     avatarDoing = "carrying note " + Letter[note] + " to " + to.name;
                     lookPoint = slot;
-                    yield return actor.WalkTo(to.Stand(slot), to.Forward);
+                    yield return actor.WalkTo(to.Stand(slot), to.Face);
                     avatarDoing = "placing note " + Letter[note] + " on " + to.name;
                     yield return actor.Reach(slot, () =>
                     {
                         actor.Carried = null; Snap(note, destination); loc[note] = destination; carrying = -1;
                         noteFaces[note].material.color = NoteColor;
-                        Log("{\"t\":" + Stamp() + ",\"role\":\"B\",\"avatar\":\"place " + Letter[note] + " on " + to.name + "\",\"handError\":" + actor.ReachError.ToString("F3", System.Globalization.CultureInfo.InvariantCulture) + "}");
+                        Log("{\"t\":" + Stamp() + ",\"role\":\"" + role + "\",\"avatar\":\"place " + Letter[note] + " on " + to.name + "\",\"handError\":" + actor.ReachError.ToString("F3", System.Globalization.CultureInfo.InvariantCulture) + "}");
                     });
                     idleSince = Time.time;
                 }
@@ -742,45 +1155,51 @@ namespace MysterySort
                 if (network.Error != "") netNote += "  (" + network.Error + ")";
             }
             if (Input.GetKeyDown(KeyCode.Escape)) Application.Quit();
-            if (role == Role.A)
+            network.Poll(now);
+            if (mr) FollowAnchors();
+            bool live = Live;
+            // Take over the partner's placements: a higher version wins; on a tie room A's view stands.
+            for (int i = 0; i < N; i++)
             {
-                if (smoke) ScriptedInput(now - smokeStart); else if (vr) HeadsetInput(); else MouseInput();
-                clueText.text = focus >= 0 ? Wrap("Note " + Letter[focus] + ": " + Clue[focus], 46) : "";
-                if (now >= nextTrace) { Sample(now); nextTrace = now + 0.4f; }
-                actor.LookPoint = cam.transform.position;
-                for (int i = 0; i < N; i++) noteFaces[i].material.color = i == held ? HeldColor : NoteColor;
-                if (now >= nextSend) { network.SendState(held, hover, held >= 0 ? held : focus, loc, eventCount, eventText); nextSend = now + 0.05f; }
-                if (now >= nextScene) { network.SendScene("A", SceneText()); nextScene = now + 1; }
-                network.Poll(now);
-                wallText.text = "ROOM A  |  you sort the clues\n" + (held >= 0 ? "Holding " + Letter[held] + (hover >= 0 ? " over " + panels[hover].name : "") : "Drag a note onto Group 1 or Group 2");
+                int theirs = network.Ver[i];
+                if (theirs > clock) clock = theirs;
+                if (theirs > ver[i] || (theirs == ver[i] && network.Loc[i] != agreed[i] && role == Role.B)) { agreed[i] = network.Loc[i]; ver[i] = theirs; }
             }
-            else
+            // Both reached for the same note at the same moment: room B lets go.
+            if (held >= 0 && live && network.Held == held && role == Role.B) { Release(loc[held]); grabSource = -1; }
+
+            if (smoke) ScriptedInput(now - smokeStart); else if (vr) HeadsetInput(now); else MouseInput();
+            if (now >= nextTrace) { Sample(now); nextTrace = now + 0.4f; }
+            actor.LookPoint = lookPoint;
+            for (int i = 0; i < N; i++)
+                noteFaces[i].material.color = i == held || i == carrying ? HeldColor : i == reachNote ? Color.Lerp(NoteColor, Color.white, 0.45f) : NoteColor;
+            if (network.TornStamp != tornSeen)
             {
-                network.Poll(now);
-                if (vr) HeadsetInput();
-                actor.LookPoint = lookPoint;
-                if (network.TornStamp != tornSeen)
+                tornSeen = network.TornStamp; int about = network.TornNote;
+                if (network.Torn.Length >= 2)
                 {
-                    tornSeen = network.TornStamp; int about = network.TornNote;
-                    if (network.Torn.Length >= 2)
-                    {
-                        if (undecided[about] == null) Log("{\"t\":" + Stamp() + ",\"role\":\"B\",\"intent\":\"note " + Letter[about] + " torn between " + panels[network.Torn[0]].name + " and " + panels[network.Torn[1]].name + "\"}");
-                        undecided[about] = new[] { network.Torn[0], network.Torn[1] };
-                        liveTornNote = about; liveTornUntil = now + 6f;
-                    }
-                    else if (about == liveTornNote) liveTornNote = -1; // the model no longer sees hesitation
+                    if (undecided[about] == null) Log("{\"t\":" + Stamp() + ",\"role\":\"" + role + "\",\"intent\":\"note " + Letter[about] + " torn between " + panels[network.Torn[0]].name + " and " + panels[network.Torn[1]].name + "\"}");
+                    undecided[about] = new[] { network.Torn[0], network.Torn[1] };
+                    liveTornNote = about; liveTornUntil = now + 6f;
                 }
-                if (now >= nextScene) { network.SendScene("B", SceneText()); nextScene = now + 1; }
-                bool live = now - network.LastReceived <= 1f;
-                wallText.text = "ROOM B  |  partner's avatar\n" + (live ? "Avatar: " + avatarDoing : "Waiting for A...");
-                captionText.text = Wrap(network.Caption, 70);
+                else if (about == liveTornNote) liveTornNote = -1; // the model no longer sees hesitation
             }
-            if (vr) wallText.text += "\n" + netNote + "\n" + inputNote;
+            if (now >= nextSend) { network.SendState(held, hover, held >= 0 ? held : focus, agreed, ver, eventCount, eventText); nextSend = now + 0.05f; }
+            if (now >= nextScene) { network.SendScene(SceneText()); nextScene = now + 1; }
+
+            string hint = vr ? "Walk to a note, pinch it, carry it to " + panels[1].name + " or " + panels[2].name + " and let go"
+                             : "Drag a note onto " + panels[1].name + " or " + panels[2].name;
+            wallText.text = "ROOM " + role + "  |  " + (held >= 0 ? "Holding " + Letter[held] + (hover >= 0 ? " over " + panels[hover].name : "") : hint) +
+                "\nPartner: " + (live ? avatarDoing : "not connected yet");
+            string clue = focus >= 0 ? Wrap("Note " + Letter[focus] + ": " + Clue[focus], 46) : "", caption = Wrap(network.Caption, 70);
+            if (clueText == captionText) clueText.text = caption + (clue != "" && caption != "" ? "\n\n" : "") + clue;
+            else { clueText.text = clue; captionText.text = caption; }
+            if (vr) wallText.text += "\n" + netNote + "\n" + inputNote + (mr ? "\n" + anchorNote : "");
             if (smoke)
             {
                 float t = now - smokeStart;
                 if (t >= nextShot) { nextShot += 2; StartCoroutine(Capture(role + "-" + (shot++).ToString("00"))); }
-                if (t > (role == Role.A ? 40 : 42))
+                if (t > (role == Role.A ? 46 : 48))
                 {
                     var state = new StringBuilder();
                     for (int i = 0; i < N; i++) state.Append(Letter[i]).Append('=').Append(loc[i] >= 0 ? panels[loc[i]].name : "in hand").Append(i < N - 1 ? ", " : "");
@@ -826,13 +1245,9 @@ namespace MysterySort
             if (vr || network == null) return; // no screen overlay inside a headset
             GUI.skin.label.fontSize = 15; GUI.skin.label.wordWrap = true;
             GUILayout.BeginArea(new Rect(14, 12, 470, 150), GUI.skin.box);
-            GUILayout.Label("Room " + role + (role == Role.A ? "  ->  " + peerIP + ":" + port : "  listening on UDP " + port));
-            if (role == Role.A)
-            {
-                GUILayout.Label("Hold the left mouse button on a note and drop it on a group panel. Esc quits.");
-                if (focus >= 0) GUILayout.Label("Note " + Letter[focus] + ": " + Clue[focus]);
-            }
-            else GUILayout.Label("The avatar replays your partner's sorting in this room's own layout. Esc quits.");
+            GUILayout.Label("Room " + role + (peerIP != "" ? "  <->  " + peerIP + ":" + port : "  listening on UDP " + listenPort));
+            GUILayout.Label("Hold the left mouse button on a note and drop it on a group panel. The avatar does what your partner does. Esc quits.");
+            if (focus >= 0) GUILayout.Label("Note " + Letter[focus] + ": " + Clue[focus]);
             if (network.Error != "") GUILayout.Label("Network: " + network.Error);
             GUILayout.EndArea();
         }

@@ -54,6 +54,8 @@ public static class QuestSortBuilder
         config.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersAndHands;
         // Adds the passthrough feature to the Android manifest.
         config.insightPassthroughSupport = mr ? OVRProjectConfig.FeatureSupport.Supported : OVRProjectConfig.FeatureSupport.None;
+        // Spatial anchors pin the panels to the real room (USE_ANCHOR_API in the manifest).
+        config.anchorSupport = mr ? OVRProjectConfig.AnchorSupport.Enabled : OVRProjectConfig.AnchorSupport.Disabled;
         EditorUtility.SetDirty(config);
         Directory.CreateDirectory("../Quest-APK");
 
@@ -79,13 +81,18 @@ public static class QuestSortBuilder
             var hand = right.GetComponent<OVRHand>(); SetEnum(hand, "HandType", 1);
             SetEnum(right.GetComponent<OVRSkeleton>(), "_skeletonType", 1);
             var mesh = right.GetComponent<OVRMesh>(); if (mesh != null) SetEnum(mesh, "_meshType", 1);
+            var left = (GameObject)PrefabUtility.InstantiatePrefab(handPrefab); left.name = "Left tracked hand";
+            left.transform.SetParent(cameraRig.leftHandAnchor, false);
+            var leftHand = left.GetComponent<OVRHand>(); SetEnum(leftHand, "HandType", 0);
+            SetEnum(left.GetComponent<OVRSkeleton>(), "_skeletonType", 0);
+            var leftMesh = left.GetComponent<OVRMesh>(); if (leftMesh != null) SetEnum(leftMesh, "_meshType", 0);
             if (mr)
             {
                 rig.GetComponent<OVRManager>().isInsightPassthroughEnabled = true;
                 var passthrough = rig.AddComponent<OVRPassthroughLayer>();
                 passthrough.overlayType = OVROverlay.OverlayType.Underlay; // real room behind everything virtual
             }
-            demo.questRig = rig; demo.rightHand = hand; rig.SetActive(false);
+            demo.questRig = rig; demo.rightHand = hand; demo.leftHand = leftHand; rig.SetActive(false);
 
             string tag = (mr ? "MR-" : "") + role;
             string scenePath = "Assets/Scenes/QuestSort" + tag.Replace("-", "") + ".unity";
