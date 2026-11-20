@@ -15,8 +15,9 @@
 
 | 头显序列号 | 应用 | 布局 |
 | --- | --- | --- |
-| 230YC01D8H00SV | `Mystery Sort MR A` | 墙面，三块竖直面板 |
-| 230YC01D8L01T6 | `Mystery Sort MR B` | 桌面，三块水平垫子 |
+| Marvin‘s | `Mystery Sort MR A` | 墙面，三块竖直面板 |
+| zhanna's| `Mystery Sort MR B` | 桌面，三块水平垫子 |
+
 
 3. 状态栏出现 `Relay 192.168.x.x` 就是连上了。
 
